@@ -202,16 +202,78 @@ pd_damping:
 - 2.0
 - 2.0
 - 2.0
-- 0.800000011920929
-- 0.4000000059604645
-- 0.4000000059604645
+- 0.8
+- 0.4
+- 0.4
 - 2.0
 - 2.0
 - 2.0
 - 2.0
-- 0.800000011920929
-- 0.4000000059604645
-- 0.4000000059604645
+- 0.8
+- 0.4
+- 0.4
+# Rotor inertias and simulated effort limits from the training articulation.
+# Order is exactly joint_names above.
+joint_armature:
+- 0.01017752
+- 0.025101925
+- 0.01017752
+- 0.025101925
+- 0.00721945
+- 0.00721945
+- 0.01017752
+- 0.025101925
+- 0.01017752
+- 0.025101925
+- 0.00721945
+- 0.00721945
+- 0.01017752
+- 0.00721945
+- 0.00721945
+- 0.003609725
+- 0.003609725
+- 0.003609725
+- 0.003609725
+- 0.003609725
+- 0.00425
+- 0.00425
+- 0.003609725
+- 0.003609725
+- 0.003609725
+- 0.003609725
+- 0.003609725
+- 0.00425
+- 0.00425
+joint_effort_limit:
+- 88.0
+- 139.0
+- 88.0
+- 139.0
+- 50.0
+- 50.0
+- 88.0
+- 139.0
+- 88.0
+- 139.0
+- 50.0
+- 50.0
+- 88.0
+- 50.0
+- 50.0
+- 25.0
+- 25.0
+- 25.0
+- 25.0
+- 25.0
+- 5.0
+- 5.0
+- 25.0
+- 25.0
+- 25.0
+- 25.0
+- 25.0
+- 5.0
+- 5.0
 observation_scales:
   phase: 1.0
   gravity: 1.0
@@ -241,6 +303,10 @@ sim:
   physics_dt: 0.001
 real:
   network_interface: eth0
+  # Unitree's official G1 low-level example releases any active onboard
+  # motion service before publishing rt/lowcmd, preventing competing writers.
+  release_motion_service: true
+  motion_service_timeout_s: 5.0
   motor_indices:
   - 0
   - 1

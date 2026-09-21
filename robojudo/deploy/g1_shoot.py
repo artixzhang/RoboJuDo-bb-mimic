@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import csv
 import math
 import os
 import struct
+import sys
 import time
 import xml.etree.ElementTree as ET
 from collections import deque
@@ -17,6 +19,39 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 FIELDS = ("phase", "gravity", "angular_velocity", "joint_position", "joint_velocity", "applied_action", "hoop_position")
 SIZES = (1, 9, 9, 87, 87, 87, 3)
+
+
+class TerminalKeys:
+    """Nonblocking single-key input for the real-robot terminal."""
+
+    def __init__(self):
+        self.fd = None
+        self.previous = None
+        self.termios = None
+
+    def __enter__(self):
+        try:
+            import termios
+            import tty
+        except ImportError:  # Non-POSIX host: remote Start remains available.
+            return self
+        if sys.stdin.isatty():
+            self.termios = termios
+            self.fd = sys.stdin.fileno()
+            self.previous = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+        return self
+
+    def poll(self) -> str | None:
+        import select
+
+        if self.fd is None or not select.select([self.fd], [], [], 0.0)[0]:
+            return None
+        return os.read(self.fd, 1).decode(errors="ignore")
+
+    def __exit__(self, *_):
+        if self.fd is not None and self.previous is not None and self.termios is not None:
+            self.termios.tcsetattr(self.fd, self.termios.TCSADRAIN, self.previous)
 
 
 def load_config(path: str | Path, onnx: str | None = None) -> dict:
@@ -32,7 +67,8 @@ def load_config(path: str | Path, onnx: str | None = None) -> dict:
     if len(names) != 29 or len(set(names)) != 29:
         raise ValueError("Expected 29 unique G1 joint names")
     for key in ("nominal_joint_position", "first_frame_joint_position", "safe_lower_joint_position",
-                "safe_upper_joint_position", "pd_stiffness", "pd_damping"):
+                "safe_upper_joint_position", "pd_stiffness", "pd_damping", "joint_armature",
+                "joint_effort_limit"):
         value = np.asarray(cfg[key], dtype=np.float64)
         if value.shape != (29,) or not np.all(np.isfinite(value)):
             raise ValueError(f"{key} must have 29 finite values")
@@ -41,6 +77,8 @@ def load_config(path: str | Path, onnx: str | None = None) -> dict:
     first = np.asarray(cfg["first_frame_joint_position"])
     if np.any(lower >= upper) or np.any(first < lower) or np.any(first > upper):
         raise ValueError("Invalid safe limits or first frame outside limits")
+    if np.any(np.asarray(cfg["joint_armature"]) < 0.0) or np.any(np.asarray(cfg["joint_effort_limit"]) <= 0.0):
+        raise ValueError("joint_armature must be nonnegative and joint_effort_limit positive")
     if cfg["policy_hz"] <= 0 or cfg["phase_frames"] < 2:
         raise ValueError("policy_hz must be positive and phase_frames at least 2")
     if set(cfg["observation_scales"]) != set(FIELDS):
@@ -182,6 +220,10 @@ class ShootingSim:
         self.pelvis = self.model.body("pelvis").id
         self.kp = np.asarray(cfg["pd_stiffness"])
         self.kd = np.asarray(cfg["pd_damping"])
+        self.effort_limit = np.asarray(cfg["joint_effort_limit"])
+        # MJCF used one fallback value for every joint. Apply the values used
+        # by the Isaac Lab articulation in policy joint order.
+        self.model.dof_armature[self.dadr] = np.asarray(cfg["joint_armature"])
         self.substeps = round(1 / (cfg["policy_hz"] * self.model.opt.timestep))
         if not np.isclose(self.substeps * self.model.opt.timestep, 1 / cfg["policy_hz"]):
             raise ValueError("physics_dt must divide the policy period")
@@ -197,6 +239,11 @@ class ShootingSim:
         self.data.qpos[self.ball_adr:self.ball_adr + 7] = [*ball_pos, 1, 0, 0, 0]
         self.mj.mj_forward(self.model, self.data)
 
+    def set_model_default(self) -> None:
+        """Restore the XML default state used by MuJoCo's Backspace action."""
+        self.mj.mj_resetData(self.model, self.data)
+        self.mj.mj_forward(self.model, self.data)
+
     def read(self):
         velocity = np.zeros(6)
         self.mj.mj_objectVelocity(self.model, self.data, self.mj.mjtObj.mjOBJ_BODY, self.pelvis, velocity, 1)
@@ -209,7 +256,8 @@ class ShootingSim:
         for _ in range(self.substeps):
             q = self.data.qpos[self.qadr]
             dq = self.data.qvel[self.dadr]
-            self.data.ctrl[self.actuators] = self.kp * (target - q) - self.kd * dq
+            torque = self.kp * (target - q) - self.kd * dq
+            self.data.ctrl[self.actuators] = np.clip(torque, -self.effort_limit, self.effort_limit)
             # The passive viewer only updates MjvPerturb. User-driven physics
             # loops must explicitly turn that mouse displacement into force.
             # Clear first so a force cannot remain on a previously selected body.
@@ -236,6 +284,9 @@ class ShootingReal:
         if len(self.indices) != 29 or len(set(self.indices)) != 29 or any(i < 0 or i >= 29 for i in self.indices):
             raise ValueError("motor_indices must map uniquely to G1 motors 0..28")
         ChannelFactoryInitialize(0, cfg["real"]["network_interface"])
+        self.motion_switcher = None
+        if cfg["real"].get("release_motion_service", True):
+            self._release_motion_service()
         self.cmd = unitree_hg_msg_dds__LowCmd_()
         self.cmd.mode_pr = 0
         for motor in self.cmd.motor_cmd:
@@ -246,6 +297,29 @@ class ShootingReal:
         self.subscriber.Init(self._receive, 10)
         self.kp = np.asarray(cfg["pd_stiffness"])
         self.kd = np.asarray(cfg["pd_damping"])
+
+    def _release_motion_service(self) -> None:
+        """Acquire the low-level channel as required by Unitree's G1 example."""
+        from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
+
+        client = MotionSwitcherClient()
+        client.SetTimeout(float(self.cfg["real"].get("motion_service_timeout_s", 5.0)))
+        client.Init()
+        for _ in range(6):
+            status, mode = client.CheckMode()
+            if status != 0 or mode is None:
+                raise RuntimeError(f"Cannot query Unitree motion service (status={status})")
+            name = mode.get("name", "")
+            if not name:
+                self.motion_switcher = client
+                print("Unitree motion service released; rt/lowcmd has low-level control")
+                return
+            print(f"Releasing active Unitree motion service: {name}")
+            status, _ = client.ReleaseMode()
+            if status != 0:
+                raise RuntimeError(f"Cannot release Unitree motion service {name!r} (status={status})")
+            time.sleep(0.5)
+        raise RuntimeError("Unitree motion service is still active; refusing competing low-level control")
 
     def _receive(self, state):
         self.state = state
@@ -267,6 +341,10 @@ class ShootingReal:
         quat = np.asarray(state.imu_state.quaternion, dtype=np.float32)
         gyro = np.asarray(state.imu_state.gyroscope, dtype=np.float32)
         return q, dq, quat, gyro
+
+    def estimated_torque(self) -> np.ndarray:
+        state = self.fresh_state()
+        return np.array([state.motor_state[i].tau_est for i in self.indices], dtype=np.float32)
 
     def _send(self, require_fresh: bool = True):
         state = self.fresh_state() if require_fresh else self.state
@@ -303,14 +381,17 @@ def run_sim(cfg: dict, check_steps: int = 0) -> None:
     policy = ShootingPolicy(cfg)
     if check_steps:
         policy.reset(sim.read())
+        peak_ball_height = float(sim.data.qpos[sim.ball_adr + 2])
+        peak_pelvis_height = float(sim.data.qpos[2])
         for _ in range(check_steps):
             sim.step(policy.step(sim.read()))
+            peak_ball_height = max(peak_ball_height, float(sim.data.qpos[sim.ball_adr + 2]))
+            peak_pelvis_height = max(peak_pelvis_height, float(sim.data.qpos[2]))
         ball_height = float(sim.data.qpos[sim.ball_adr + 2])
         pelvis_height = float(sim.data.qpos[2])
         print(f"sim2sim ran {check_steps} steps; phase={policy.observation()[0]:.3f}; "
-              f"ball_z={ball_height:.3f} m; pelvis_z={pelvis_height:.3f} m")
-        if ball_height < 0.2 or pelvis_height < 0.4:
-            print("Physical outcome: ball on floor or robot down; shot NOT validated")
+              f"pelvis_z_peak={peak_pelvis_height:.3f} m; ball_z_peak={peak_ball_height:.3f} m; "
+              f"pelvis_z_final={pelvis_height:.3f} m; ball_z_final={ball_height:.3f} m")
         return
 
     import glfw
@@ -321,7 +402,9 @@ def run_sim(cfg: dict, check_steps: int = 0) -> None:
         keys.append(key)
 
     stage = "waiting"
-    print("MuJoCo: S = first frame, A = start policy, Esc = exit")
+    paused = False
+    print("MuJoCo: S = shooting initial state, A = start, Space = pause/resume, "
+          "Backspace = XML default, Esc = exit")
     print("Mouse force: double-click a body, then Ctrl+drag it (Ctrl+right-drag translates)")
     with mujoco.viewer.launch_passive(sim.model, sim.data, key_callback=on_key) as viewer:
         viewer.cam.lookat[:] = sim.data.qpos[:3]
@@ -334,13 +417,38 @@ def run_sim(cfg: dict, check_steps: int = 0) -> None:
                 key = keys.popleft()
                 if key == glfw.KEY_ESCAPE:
                     return
-                if key == glfw.KEY_S and stage == "waiting":
-                    sim.set_first_pose(); stage = "ready"
-                    print("First frame set. Press A to run.")
+                if key == glfw.KEY_BACKSPACE:
+                    with viewer.lock():
+                        sim.set_model_default()
+                        sim.data.xfrc_applied[:] = 0.0
+                        viewer.perturb.active = 0
+                        viewer.perturb.active2 = 0
+                        viewer.perturb.select = 0
+                    stage = "waiting"
+                    paused = False
+                    next_tick = time.monotonic()
+                    print("Simulation reset to the XML default pose. Press S for the shooting initial state.")
+                    continue
+                if key == glfw.KEY_S:
+                    with viewer.lock():
+                        sim.set_first_pose()
+                        policy.reset(sim.read())
+                        sim.data.xfrc_applied[:] = 0.0
+                        viewer.perturb.active = 0
+                        viewer.perturb.active2 = 0
+                        viewer.perturb.select = 0
+                    stage = "ready"
+                    paused = False
+                    next_tick = time.monotonic()
+                    print("Robot and ball reset to the shooting initial state. Press A to run.")
                 if key == glfw.KEY_A and stage == "ready":
-                    policy.reset(sim.read()); stage = "running"
+                    policy.reset(sim.read()); stage = "running"; paused = False
                     print("Policy running; phase advances to 1 and stays there.")
-            if stage == "running":
+                if key == glfw.KEY_SPACE and stage == "running":
+                    paused = not paused
+                    next_tick = time.monotonic()
+                    print("Simulation paused." if paused else "Simulation resumed.")
+            if stage == "running" and not paused:
                 # Viewer input lives on its render thread. Hold its lock while
                 # consuming the selected body and perturbation reference.
                 with viewer.lock():
@@ -356,48 +464,105 @@ def run_real(cfg: dict) -> None:
     real = ShootingReal(cfg)
     policy = ShootingPolicy(cfg)
     period = 1 / cfg["policy_hz"]
-    print("G1: debug mode (L2+R2) first; Start = first pose, A = policy, Select = damping/exit")
+    log_file = None
+    log_writer = None
+    peak_leg_command_rms = 0.0
+    peak_leg_error_rms = 0.0
+    peak_leg_torque = 0.0
+    log_path = cfg["real"].get("log_path")
+    if log_path:
+        log_path = Path(log_path).expanduser().resolve()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_file = log_path.open("w", newline="")
+        fields = ["elapsed_s", "phase"]
+        for prefix in ("q", "dq", "target", "error", "pd_torque", "tau_est"):
+            fields.extend(f"{prefix}.{name}" for name in cfg["joint_names"])
+        fields.extend(("quat_w", "quat_x", "quat_y", "quat_z", "gyro_x", "gyro_y", "gyro_z"))
+        log_writer = csv.writer(log_file)
+        log_writer.writerow(fields)
+        print(f"Real telemetry: {log_path}")
+    print("G1: debug mode (L2+R2) first; Start or terminal S = prepare, A = policy, Select = exit")
     try:
         while real.state is None:
             time.sleep(period)
+        print(f"Connected to G1 lowstate; mode_machine={real.fresh_state().mode_machine}")
         stage = "waiting"
         first = np.asarray(cfg["first_frame_joint_position"], dtype=np.float32)
         next_tick = time.monotonic()
+        run_start = next_tick
         previous_buttons = 0
-        while True:
-            buttons = real.buttons()
-            pressed = buttons & ~previous_buttons
-            previous_buttons = buttons
-            if pressed & (1 << 3):  # Select, official exit key
-                break
-            if stage == "waiting":
-                real.zero()
-                if pressed & (1 << 2):  # Start
+        with TerminalKeys() as terminal:
+            while True:
+                buttons = real.buttons()
+                pressed = buttons & ~previous_buttons
+                previous_buttons = buttons
+                key = terminal.poll()
+                if pressed & (1 << 3):  # Select, official exit key
+                    break
+                if (pressed & (1 << 2)) or key in ("s", "S"):  # Start / terminal S
                     initial = real.read()[0]
                     move_steps = max(1, round(cfg["real"]["move_to_first_pose_s"] * cfg["policy_hz"]))
                     move_tick = 0
                     stage = "moving"
-                    print("Moving to first-frame joint pose")
-            elif stage == "moving":
-                move_tick += 1
-                alpha = min(move_tick / move_steps, 1.0)
-                real.position(initial * (1 - alpha) + first * alpha)
-                if alpha >= 1.0:
-                    stage = "ready"
-                    print("First frame reached. Place the ball and press A.")
-            elif stage == "ready":
-                real.position(first)
-                if pressed & (1 << 8):  # A
-                    policy.reset(real.read())
-                    stage = "running"
-                    print("Policy running")
-            else:
-                real.position(policy.step(real.read()))
-            next_tick += period
-            time.sleep(max(0.0, next_tick - time.monotonic()))
-            if time.monotonic() - next_tick > cfg["real"]["state_timeout_s"]:
-                raise RuntimeError("Control loop missed state timeout")
+                    print("Preparing another shot: moving to the first-frame joint pose")
+                if stage == "waiting":
+                    real.zero()
+                elif stage == "moving":
+                    move_tick += 1
+                    alpha = min(move_tick / move_steps, 1.0)
+                    real.position(initial * (1 - alpha) + first * alpha)
+                    if alpha >= 1.0:
+                        first_state = real.read()
+                        first_error = first - first_state[0]
+                        first_rms = float(np.sqrt(np.mean(first_error**2)))
+                        first_max = float(np.max(np.abs(first_error)))
+                        policy.reset(first_state)
+                        stage = "ready"
+                        print(f"First-frame tracking: rms={first_rms:.3f} rad, max={first_max:.3f} rad")
+                        if first_max > 0.15:
+                            print("First-frame error is too large; check low-level control ownership before pressing A.")
+                        else:
+                            print("First frame reached. Place the ball and press A.")
+                elif stage == "ready":
+                    real.position(first)
+                    if pressed & (1 << 8):  # A
+                        policy.reset(real.read())
+                        stage = "running"
+                        run_start = time.monotonic()
+                        peak_leg_command_rms = 0.0
+                        peak_leg_error_rms = 0.0
+                        peak_leg_torque = 0.0
+                        print("Policy running")
+                else:
+                    state = real.read()
+                    target = policy.step(state)
+                    real.position(target)
+                    q, dq, quat, gyro = state
+                    error = target - q
+                    pd_torque = real.kp * error - real.kd * dq
+                    tau_est = real.estimated_torque()
+                    legs = slice(0, 12)
+                    command_rms = float(np.sqrt(np.mean((target[legs] - first[legs]) ** 2)))
+                    error_rms = float(np.sqrt(np.mean(error[legs] ** 2)))
+                    peak_leg_command_rms = max(peak_leg_command_rms, command_rms)
+                    peak_leg_error_rms = max(peak_leg_error_rms, error_rms)
+                    peak_leg_torque = max(peak_leg_torque, float(np.max(np.abs(tau_est[legs]))))
+                    if log_writer is not None:
+                        log_writer.writerow((time.monotonic() - run_start, policy.observation()[0],
+                                             *q, *dq, *target, *error, *pd_torque, *tau_est, *quat, *gyro))
+                    if policy.frame % max(1, round(cfg["policy_hz"] / 5)) == 0:
+                        print(f"phase={policy.observation()[0]:.3f} leg_command_rms={command_rms:.3f} rad "
+                              f"leg_error_rms={error_rms:.3f} rad tau_est_max={np.max(np.abs(tau_est[legs])):.1f} Nm")
+                next_tick += period
+                time.sleep(max(0.0, next_tick - time.monotonic()))
+                if time.monotonic() - next_tick > cfg["real"]["state_timeout_s"]:
+                    raise RuntimeError("Control loop missed state timeout")
     finally:
+        if log_file is not None:
+            log_file.close()
+        if peak_leg_command_rms > 0.0:
+            print(f"Shot telemetry peaks: leg_command_rms={peak_leg_command_rms:.3f} rad, "
+                  f"leg_error_rms={peak_leg_error_rms:.3f} rad, tau_est={peak_leg_torque:.1f} Nm")
         for _ in range(10):
             real.damping()
             time.sleep(period)
