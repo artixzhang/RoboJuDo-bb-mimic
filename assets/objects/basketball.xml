@@ -1,0 +1,9 @@
+<mujoco model="basketball">
+  <worldbody>
+    <body name="basketball" pos="0 0 0.123">
+      <freejoint name="basketball_free"/>
+      <geom name="basketball_geom" type="sphere" size="0.123" mass="0.625"
+            friction="0.8 0.005 0.0001" rgba="0.94 0.38 0.06 1"/>
+    </body>
+  </worldbody>
+</mujoco>
